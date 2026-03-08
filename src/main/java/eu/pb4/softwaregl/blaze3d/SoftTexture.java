@@ -9,22 +9,26 @@ import eu.pb4.softwaregl.blaze3d.texture.TextureLike;
 import java.util.Arrays;
 
 public class SoftTexture extends GpuTexture {
-    public TextureLike[] texture;
-    public RGBATexture[] rgba;
-    public DepthTexture[] depth;
+    public final TextureLike[] texture;
+    public final RGBATexture[] rgba;
+    public final DepthTexture[] depth;
 
     public SoftTexture(@Usage int usage, String label, TextureFormat format, int width, int height, int depthOrLayers, int mipLevels) {
         super(usage, label, format, width, height, depthOrLayers, mipLevels);
+        var layerHeight = height * depthOrLayers;
+
         this.texture = new TextureLike[mipLevels];
         if (format == TextureFormat.DEPTH32) {
             this.depth = new DepthTexture[mipLevels];
+            this.rgba = new RGBATexture[0];
             for (int i = 0; i < mipLevels; i++) {
                 this.texture[i] = this.depth[i] = new DepthTexture(width >>> i, height >>> i);
             }
         } else {
             this.rgba = new RGBATexture[mipLevels];
+            this.depth = new DepthTexture[0];
             for (int i = 0; i < mipLevels; i++) {
-                this.texture[i] = this.rgba[i] = new RGBATexture(width >>> i, height >>> i);
+                this.texture[i] = this.rgba[i] = new RGBATexture(width >>> i, height >>> i, layerHeight >>> i);
             }
         }
 
@@ -34,8 +38,16 @@ public class SoftTexture extends GpuTexture {
         return this.rgba[mip].get(x, y);
     }
 
+    public int getRGBA(int depth, int mip, int x, int y) {
+        return this.rgba[mip].get(depth, x, y);
+    }
+
     public void setRGBA(int mip, int x, int y, int color) {
         this.rgba[mip].set(x, y, color);
+    }
+
+    public void setRGBA(int depth, int mip, int x, int y, int color) {
+        this.rgba[mip].set(depth, x, y, color);
     }
 
     public void setDepth(int mip, int x, int y, double color) {

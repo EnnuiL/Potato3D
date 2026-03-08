@@ -97,14 +97,14 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
             case RGBA -> {
                 for (int x = 0; x < width; x++) {
                     for (int y = 0; y < height; y++) {
-                        dest.setRGBA(mipLevel, destX + x, destY + y, Integer.reverseBytes(ARGB.toABGR(source.getPixel(x + sourceX, y + sourceY))));
+                        dest.setRGBA(depthOrLayer, mipLevel, destX + x, destY + y, Integer.reverseBytes(ARGB.toABGR(source.getPixel(x + sourceX, y + sourceY))));
                     }
                 }
             }
             case RGB -> {
                 for (int x = 0; x < width; x++) {
                     for (int y = 0; y < height; y++) {
-                        dest.setRGBA(mipLevel, destX + x, destY + y, Integer.reverseBytes(ARGB.toABGR(source.getPixel(x + sourceX, y + sourceY)) << 8 | 0xFF));
+                        dest.setRGBA(depthOrLayer, mipLevel, destX + x, destY + y, Integer.reverseBytes(ARGB.toABGR(source.getPixel(x + sourceX, y + sourceY)) << 8 | 0xFF));
                     }
                 }
             }
@@ -112,7 +112,7 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
                 for (int x = 0; x < width; x++) {
                     for (int y = 0; y < height; y++) {
                         var c = Byte.toUnsignedInt(source.getLuminanceOrAlpha(x + sourceX, y + sourceY));
-                        dest.setRGBA(mipLevel, destX + x, destY + y, RGBA.colorARGB(0xFF, c, c, c));
+                        dest.setRGBA(depthOrLayer, mipLevel, destX + x, destY + y, RGBA.colorARGB(0xFF, c, c, c));
                     }
                 }
             }
@@ -130,14 +130,14 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
             case RGBA -> {
                 for (int x = destX; x < destX + width; x++) {
                     for (int y = destY; y < destY + height; y++) {
-                        dest.setRGBA(mipLevel, x, y, source.getInt());
+                        dest.setRGBA(depthOrLayer, mipLevel, x, y, source.getInt());
                     }
                 }
             }
             case RGB -> {
                 for (int x = destX; x < destX + width; x++) {
                     for (int y = destY; y < destY + height; y++) {
-                        dest.setRGBA(mipLevel, x, y,
+                        dest.setRGBA(depthOrLayer, mipLevel, x, y,
                                 Byte.toUnsignedInt(source.get()) << 24
                                         | Byte.toUnsignedInt(source.get()) << 16
                                         | Byte.toUnsignedInt(source.get()) << 8
@@ -149,7 +149,7 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
             case LUMINANCE -> {
                 for (int x = destX; x < destX + width; x++) {
                     for (int y = destY; y < destY + height; y++) {
-                        dest.setRGBA(mipLevel, x, y,
+                        dest.setRGBA(depthOrLayer, mipLevel, x, y,
                                 ARGB.setBrightness(0xFFFFFFFF, Byte.toUnsignedInt(source.get()))
                         );
                     }
@@ -159,7 +159,7 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
                 for (int x = destX; x < destX + width; x++) {
                     for (int y = destY; y < destY + height; y++) {
                         var base = ARGB.setBrightness(0xFFFFFFFF, Byte.toUnsignedInt(source.get()));
-                        dest.setRGBA(mipLevel, x, y,
+                        dest.setRGBA(depthOrLayer, mipLevel, x, y,
                                 ARGB.color(Byte.toUnsignedInt(source.get()), base)
                         );
                     }
