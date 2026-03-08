@@ -2,45 +2,48 @@ package eu.pb4.softwaregl.blaze3d;
 
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.TextureFormat;
-import eu.pb4.softwaregl.RGBA;
-import net.minecraft.util.RandomSource;
+import eu.pb4.softwaregl.blaze3d.texture.DepthTexture;
+import eu.pb4.softwaregl.blaze3d.texture.RGBATexture;
+import eu.pb4.softwaregl.blaze3d.texture.TextureLike;
 
 import java.util.Arrays;
 
 public class SoftTexture extends GpuTexture {
-    private final int width;
-    public int[][] buffers;
-    public float[][] depth;
+    public TextureLike[] texture;
+    public RGBATexture[] rgba;
+    public DepthTexture[] depth;
 
     public SoftTexture(@Usage int usage, String label, TextureFormat format, int width, int height, int depthOrLayers, int mipLevels) {
         super(usage, label, format, width, height, depthOrLayers, mipLevels);
-        this.buffers = new int[mipLevels][];
-        this.depth = new float[mipLevels][];
-        var r = RandomSource.create();
-        int rand = 0;//RGBA.colorARGB(0xFF, r.nextInt(255), r.nextInt(255), r.nextInt(255));
-        for (int i = 0; i < mipLevels; i++) {
-            this.buffers[i] = new int[(width >> i) * (height >> i)];
-            Arrays.fill(this.buffers[i], rand);
-            this.depth[i] = new float[(width >> i) * (height >> i)];
-            Arrays.fill(this.depth[i], 0);
+        this.texture = new TextureLike[mipLevels];
+        if (format == TextureFormat.DEPTH32) {
+            this.depth = new DepthTexture[mipLevels];
+            for (int i = 0; i < mipLevels; i++) {
+                this.texture[i] = this.depth[i] = new DepthTexture(width >>> i, height >>> i);
+            }
+        } else {
+            this.rgba = new RGBATexture[mipLevels];
+            for (int i = 0; i < mipLevels; i++) {
+                this.texture[i] = this.rgba[i] = new RGBATexture(width >>> i, height >>> i);
+            }
         }
-        this.width = width;
+
     }
 
     public int getRGBA(int mip, int x, int y) {
-        return this.buffers[mip][x + y * getWidth(mip)];
+        return this.rgba[mip].get(x, y);
     }
 
     public void setRGBA(int mip, int x, int y, int color) {
-        this.buffers[mip][x + y * getWidth(mip)] = color;
+        this.rgba[mip].set(x, y, color);
     }
 
     public void setDepth(int mip, int x, int y, double color) {
-        this.depth[mip][x + y * getWidth(mip)] = (float) color;
+        this.depth[mip].set(x, y, (float) color);
     }
 
     public float getDepth(int mip, int x, int y) {
-        return this.depth[mip][x + y * getWidth(mip)];
+        return this.depth[mip].get(x, y);
     }
 
     @Override
@@ -55,21 +58,21 @@ public class SoftTexture extends GpuTexture {
 
     public void clear(int clearColor) {
         for (int i = 0; i < this.getMipLevels(); i++) {
-            Arrays.fill(this.buffers[i], clearColor);
+            Arrays.fill(this.rgba[i].data(), clearColor);
         }
     }
 
     public void clear(int mip, int clearColor) {
-        Arrays.fill(this.buffers[mip], clearColor);
+        Arrays.fill(this.rgba[mip].data(), clearColor);
     }
 
     public void clear(int mip, double clearDepth) {
-        clear(mip, (int) clearDepth * 1024);
+        Arrays.fill(this.depth[mip].data(), (float) clearDepth);
     }
 
     public void clear(double clearDepth) {
         for (int i = 0; i < this.getMipLevels(); i++) {
-            Arrays.fill(this.depth[i], (float) clearDepth);
+            Arrays.fill(this.depth[i].data(), (float) clearDepth);
         }
     }
 

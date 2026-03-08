@@ -47,7 +47,7 @@ public class SoftRenderPass implements RenderPassBackend {
     public SoftRenderPass(SoftCommandEncoder encoder, String label, SoftTextureView colorTexture, @Nullable SoftTextureView depthTexture) {
         this.encoder = encoder;
         this.colorTexture = colorTexture;
-        this.defaultScissor = new Scissor(0, 0, colorTexture.getWidth(colorTexture.baseMipLevel()), colorTexture.getHeight(colorTexture.baseMipLevel()));
+        this.defaultScissor = new Scissor(0, 0, colorTexture.getWidth(0), colorTexture.getHeight(0));
         this.scissor = defaultScissor;
         this.depthTexture = depthTexture;
     }
@@ -408,13 +408,29 @@ public class SoftRenderPass implements RenderPassBackend {
     }
 
 
-    public void drawTriangle(SoftTexture color, @Nullable SoftTexture depth, int offset, int index, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, @Nullable SampledTexture texture) {
-        var drawnColor = new Vector4f();
-        var originalColor = new Vector4f();
-
+    private void drawTriangle(SoftTexture color, @Nullable SoftTexture depth, int offset, int index, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, @Nullable SampledTexture texture) {
         var vec0 = vec[offset + (index % 4)];
         var vec1 = vec[offset + ((index + 1) % 4)];
         var vec2 = vec[offset + ((index + 2) % 4)];
+
+        var minX = (int) Math.min(vec0.x, Math.min(vec1.x, vec2.x));
+        var maxX = (int) Math.max(vec0.x, Math.max(vec1.x, vec2.x));
+        var minY = (int) Math.min(vec0.y, Math.min(vec1.y, vec2.y));
+        var maxY = (int) Math.max(vec0.y, Math.max(vec1.y, vec2.y));
+
+        var scissor = this.scissor;
+
+        if (minX > scissor.x2() || maxX < scissor.x1() || minY > scissor.y2() || maxY < scissor.y1()) {
+            return;
+        }
+
+        minX = Math.max(minX, scissor.x1);
+        maxX = Math.min(maxX, scissor.x2 - 1);
+        minY = Math.max(minY, scissor.y1);
+        maxY = Math.min(maxY, scissor.y2 - 1);
+
+        var drawnColor = new Vector4f();
+        var originalColor = new Vector4f();
 
         var uv0 = uvs[offset + (index % 4)];
         var uv1 = uvs[offset + ((index + 1) % 4)];
@@ -424,13 +440,10 @@ public class SoftRenderPass implements RenderPassBackend {
         var color1 = colors[offset + ((index + 1) % 4)];
         var color2 = colors[offset + ((index + 2) % 4)];
 
-        var minX = Mth.clamp((int) Math.min(vec0.x, Math.min(vec1.x, vec2.x)), this.scissor.x1, this.scissor.x2 - 1);
-        var maxX = Mth.clamp((int) Math.max(vec0.x, Math.max(vec1.x, vec2.x)), this.scissor.x1, this.scissor.x2 - 1);
-        var minY = Mth.clamp((int) Math.min(vec0.y, Math.min(vec1.y, vec2.y)), this.scissor.y1, this.scissor.y2 - 1);
-        var maxY = Mth.clamp((int) Math.max(vec0.y, Math.max(vec1.y, vec2.y)), this.scissor.y1, this.scissor.y2 - 1);
-
         var totalArea = signedTriangleArea(vec0.x, vec0.y, vec1.x, vec1.y, vec2.x, vec2.y);
         if (totalArea < 1 && (this.pipeline.isCull() || totalArea > -1)) return;
+
+        totalArea = 1 / totalArea;
 
         for (int x = minX; x <= maxX; x++) {
             for (int y = minY; y <= maxY; y++) {
@@ -443,12 +456,12 @@ public class SoftRenderPass implements RenderPassBackend {
                 var gamma = signedTriangleArea(x + 0.5f, y + 0.5f, vec0.x, vec0.y, vec1.x, vec1.y);
                 if (gamma < 0) continue;
 
-                alpha /= totalArea;
-                beta /= totalArea;
-                gamma /= totalArea;
+                alpha *= totalArea;
+                beta *= totalArea;
+                gamma *= totalArea;
                 var z = (alpha * vec0.z + beta * vec1.z + gamma * vec2.z);
 
-                if (this.depthTest.test(depth.getDepth(0, x, y), z)) {
+                if (depth == null || this.depthTest.test(depth.getDepth(0, x, y), z)) {
                     var u = (alpha * uv0.x + beta * uv1.x + gamma * uv2.x);
                     var v = (alpha * uv0.y + beta * uv1.y + gamma * uv2.y);
 
@@ -461,9 +474,7 @@ public class SoftRenderPass implements RenderPassBackend {
 
                     if (this.blender == ColorBlender.SOLID) {
                         clr.w = 1;
-                    }
-
-                    if (clr.w < 0.05) {
+                    } else if (clr.w < 0.05) {
                         continue;
                     }
 
@@ -471,7 +482,7 @@ public class SoftRenderPass implements RenderPassBackend {
                         depth.setDepth(0, x, y, z);
                     }
 
-                    var out = this.blender.blend(RGBA.toVector4f(color.getRGBA(0, x, y), originalColor), drawnColor);
+                    var out = this.blender.blend.applyAsInt(RGBA.toVector4f(color.getRGBA(0, x, y), originalColor), drawnColor);
                     color.setRGBA(0, x, y, out);
                 }
             }

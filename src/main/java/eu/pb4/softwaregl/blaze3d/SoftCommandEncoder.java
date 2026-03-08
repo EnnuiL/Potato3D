@@ -170,7 +170,7 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void copyTextureToBuffer(GpuTexture source, GpuBuffer destination, long offset, Runnable callback, int mipLevel) {
-        var src = ((SoftTexture) source).buffers[mipLevel];
+        var src = ((SoftTexture) source).rgba[mipLevel].data();
         var dest = ((SoftBuffer) destination).data();
 
         switch (source.getFormat()) {
@@ -193,10 +193,10 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
                 }
             }
             case DEPTH32 -> {
-                var srcd = ((SoftTexture) source).depth[mipLevel];
+                var srcd = ((SoftTexture) source).depth[mipLevel].data();
 
                 for (int i = 0; i < src.length; i++) {
-                    dest.putFloat((int) (offset + i * 4), (float) (srcd[i]));
+                    dest.putFloat((int) (offset + i * 4), srcd[i]);
                 }
             }
         }
@@ -229,14 +229,14 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
         var txt = (SoftTexture) texture.texture();
         GL11.glViewport(0, 0, width, height);
         GL11.glClearColor(0, 0, 0, 0);
-        var swap = new int[txt.buffers[0].length];
+        var swap = new int[txt.rgba[0].data().length];
 
         for (int i = 0; i < swap.length; i++) {
-            var color = txt.buffers[0][i];
+            var color = txt.rgba[0].data()[i];
             swap[i] = Integer.reverseBytes(color | 0xFF);
         }
 
-        GL11.glClearColor(0, 0, 0,0);
+        GL11.glClearColor(0, 0, 0, 0);
         GL11.glDrawPixels(width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, swap);
     }
 
