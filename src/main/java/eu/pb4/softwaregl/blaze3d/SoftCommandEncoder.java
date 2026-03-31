@@ -10,11 +10,15 @@ import com.mojang.blaze3d.systems.RenderPassBackend;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import eu.pb4.softwaregl.RGBA;
+import eu.pb4.softwaregl.SoftwareGL;
+import net.minecraft.client.Minecraft;
+import net.minecraft.resources.Identifier;
 import net.minecraft.util.ARGB;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.opengl.GL11;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
@@ -224,20 +228,55 @@ public class SoftCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void presentTexture(GpuTextureView texture) {
+        // Only OpenGl needed
+        // Ideally I would kill it, but that might require swapping used window library
+        // And that is pain.
+
+        var outWidth = SoftwareGL.framebufferWidth;
+        var outHeight = SoftwareGL.framebufferHeight;
         var width = texture.getWidth(0);
         var height = texture.getHeight(0);
         var txt = (SoftTexture) texture.texture();
-        GL11.glViewport(0, 0, width, height);
         GL11.glClearColor(0, 0, 0, 0);
-        var swap = new int[txt.rgba[0].data().length];
 
-        for (int i = 0; i < swap.length; i++) {
-            var color = txt.rgba[0].data()[i];
-            swap[i] = Integer.reverseBytes(color | 0xFF);
+        int[] out;
+        if (outWidth == width && outHeight == height) {
+            out = new int[txt.rgba[0].data().length];
+
+            for (int i = 0; i < out.length; i++) {
+                var color = txt.rgba[0].data()[i];
+                out[i] = Integer.reverseBytes(color | 0xFF);
+            }
+        } else {
+            out = new int[outHeight * outWidth];
+
+            /*for (var y = 0; y < outHeight; y++) {
+                var gray = ARGB.gray((float) (y) / outHeight / 2 + 0.25f);
+
+                Arrays.fill(out, y * outHeight, (y + 1) * outWidth - 1, ARGB.toABGR(gray));
+            }*/
+
+            var sX = Math.min(outWidth / width, outHeight / height);
+            var offsetBaseX = (outWidth - width * sX) / 2;
+            var offsetBaseY = (outHeight - height * sX) / 2;
+            for (int y = 0; y < height; y++) {
+                var yOff = y * width;
+                var ys = (y * sX + offsetBaseY) * outWidth + offsetBaseX;
+                for (int x = 0; x < width; x++) {
+                    var xs = x * sX;
+                    var color = Integer.reverseBytes(txt.rgba[0].data()[x + yOff]);
+
+                    for (var xa = 0; xa < sX; xa++) {
+                        for (var ya = 0; ya < sX; ya++) {
+                            out[xs + xa + ys + ya * outWidth] = color;
+                        }
+                    }
+                }
+            }
         }
 
         GL11.glClearColor(0, 0, 0, 0);
-        GL11.glDrawPixels(width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, swap);
+        GL11.glDrawPixels(outWidth, outHeight, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, out);
     }
 
     @Override

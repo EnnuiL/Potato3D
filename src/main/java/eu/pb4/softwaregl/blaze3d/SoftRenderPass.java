@@ -8,12 +8,14 @@ import com.mojang.blaze3d.platform.CompareOp;
 import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderPassBackend;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.textures.AddressMode;
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import eu.pb4.softwaregl.RGBA;
+import eu.pb4.softwaregl.blaze3d.shader.EndShader;
+import eu.pb4.softwaregl.blaze3d.shader.SampledTexture;
+import eu.pb4.softwaregl.blaze3d.shader.SoftShader;
 import eu.pb4.softwaregl.blaze3d.texture.DepthTexture;
 import eu.pb4.softwaregl.blaze3d.texture.RGBATexture;
 import net.minecraft.client.renderer.RenderPipelines;
@@ -24,6 +26,7 @@ import org.jspecify.annotations.Nullable;
 import java.lang.Math;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -37,7 +40,6 @@ public class SoftRenderPass implements RenderPassBackend {
     private final Map<String, SampledTexture> binds = new HashMap<>();
     private final Map<String, Std140Reader> uniforms = new HashMap<>();
     private final ByteBuffer[] vertexBuffers = new ByteBuffer[1];
-    private final Scissor defaultScissor;
     private boolean closed;
     private RenderPipeline pipeline;
     private ByteBuffer indexBuffer;
@@ -47,6 +49,7 @@ public class SoftRenderPass implements RenderPassBackend {
     private ColorBlender blender;
     private boolean writeDepth;
     private boolean limitDepth;
+    private float depthBias;
     private int vertexLength;
     private int positionOffset;
     private int colorOffset;
@@ -54,27 +57,39 @@ public class SoftRenderPass implements RenderPassBackend {
     private int uv1Offset;
     private int uv2Offset;
     private int normalOffset;
+    private int lineWidth;
     private boolean isGlint;
     private DrawCall drawCall = this::executeDraw;
 
     public SoftRenderPass(SoftCommandEncoder encoder, String label, SoftTextureView colorTexture, @Nullable SoftTextureView depthTexture) {
         this.encoder = encoder;
         this.colorTexture = colorTexture;
-        this.defaultScissor = new Scissor(0, 0, colorTexture.getWidth(0), colorTexture.getHeight(0));
-        this.scissor = defaultScissor;
+        this.scissor = null;
         this.depthTexture = depthTexture;
     }
 
-    private static void lerp(int a, int b, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, float frec) {
+    private static void lerp(int a, int b, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals, float frec) {
         vec[a].lerp(vec[b], frec, vec[out]);
         uvs[a].lerp(uvs[b], frec, uvs[out]);
         colors[a].lerp(colors[b], frec, colors[out]);
+        normals[a].lerp(normals[b], frec, normals[out]);
     }
 
-    private static void copy(int a, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors) {
+    private static void copy(int a, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals) {
         vec[out].set(vec[a]);
         uvs[out].set(uvs[a]);
         colors[out].set(colors[a]);
+        normals[out].set(normals[a]);
+    }
+
+    private static void lerp(int a, int b, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals, float[] lineWidth, float frec) {
+        lerp(a, b, out, vec, uvs, colors, normals, frec);
+        lineWidth[out] = Mth.lerp(frec, lineWidth[a], lineWidth[b]);
+    }
+
+    private static void copy(int a, int out, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals, float[] lineWidth) {
+        copy(a, out, vec, uvs, colors, normals);
+        lineWidth[out] = lineWidth[a];
     }
 
     @Override
@@ -111,7 +126,7 @@ public class SoftRenderPass implements RenderPassBackend {
 
     @Override
     public void disableScissor() {
-        this.scissor = this.defaultScissor;
+        this.scissor = null;
     }
 
     @Override
@@ -175,6 +190,7 @@ public class SoftRenderPass implements RenderPassBackend {
         this.uv1Offset = vertexFormat.getOffset(VertexFormatElement.UV1);
         this.uv2Offset = vertexFormat.getOffset(VertexFormatElement.UV2);
         this.normalOffset = vertexFormat.getOffset(VertexFormatElement.NORMAL);
+        this.lineWidth = vertexFormat.getOffset(VertexFormatElement.LINE_WIDTH);
 
         this.isGlint = this.pipeline.getColorTargetState().blendFunction().isPresent() && this.pipeline.getColorTargetState().blendFunction().get() == BlendFunction.GLINT;
 
@@ -182,6 +198,7 @@ public class SoftRenderPass implements RenderPassBackend {
         var depthStencilState = pipeline.getDepthStencilState();
         this.writeDepth = depthStencilState != null && depthStencilState.writeDepth();
         this.limitDepth = depthStencilState != null && depthStencilState.depthTest() != CompareOp.ALWAYS_PASS;
+        this.depthBias = depthStencilState != null ? depthStencilState.depthBiasScaleFactor() * Mth.EPSILON * 10 : 0;
         this.depthTest = depthStencilState != null ? switch (depthStencilState.depthTest()) {
             case ALWAYS_PASS -> (image, drawn) -> true;
             case EQUAL -> (image, drawn) -> image == drawn;
@@ -212,6 +229,8 @@ public class SoftRenderPass implements RenderPassBackend {
             this.blender = ColorBlender.PREMULTIPLIED_BLEND;
         } else if (colorState.blendFunction().get() == BlendFunction.TRANSLUCENT) {
             this.blender = ColorBlender.ALPHA_BLEND;
+        } else if (pipeline == RenderPipelines.CRUMBLING) {
+            this.blender = ColorBlender.MULTIPLY;
         } else {
             this.blender = ColorBlender.PREMULTIPLIED_BLEND;
         }
@@ -260,13 +279,14 @@ public class SoftRenderPass implements RenderPassBackend {
         if (this.pipeline == RenderPipelines.ANIMATE_SPRITE_BLIT) {
             SampledTexture sprite = this.binds.get("Sprite");
 
-            var spriteWidth = sprite.texture.getWidth(0);
-            var spriteHeight = sprite.texture.getHeight(0);
+            var spriteWidth = sprite.texture().getWidth(0);
+            var spriteHeight = sprite.texture().getHeight(0);
             var margin = (lengthX - spriteWidth) / 2;
 
             for (int x = minX; x < maxX; x++) {
                 for (int y = minY; y < maxY; y++) {
                     output.setRGBA(0, x, y, sprite.sample(
+                            x, y,
                             (float) (x - minX - margin) / spriteWidth,
                             (float) (y - minY - margin) / spriteHeight,
                             0, 0
@@ -278,8 +298,8 @@ public class SoftRenderPass implements RenderPassBackend {
             SampledTexture currentSprite = this.binds.get("CurrentSprite");
             SampledTexture nextSprite = this.binds.get("NextSprite");
 
-            var spriteWidth = currentSprite.texture.getWidth(0);
-            var spriteHeight = currentSprite.texture.getHeight(0);
+            var spriteWidth = currentSprite.texture().getWidth(0);
+            var spriteHeight = currentSprite.texture().getHeight(0);
 
             var margin = (lengthX - spriteWidth) / 2;
 
@@ -288,8 +308,8 @@ public class SoftRenderPass implements RenderPassBackend {
                     var u = (float) (x - minX - margin) / spriteWidth;
                     var v = (float) (y - minY - margin) / spriteHeight;
 
-                    var curr = currentSprite.sample(u, v, 0, 0);
-                    var next = nextSprite.sample(u, v, 0, 0);
+                    var curr = currentSprite.sample(x, y, u, v, 0, 0);
+                    var next = nextSprite.sample(x, y, u, v, 0, 0);
 
                     output.setRGBA(0, x, y, RGBA.colorARGB(
                             (RGBA.alpha(curr) * invProgress + RGBA.alpha(next) * progress) / maxProgress,
@@ -390,7 +410,7 @@ public class SoftRenderPass implements RenderPassBackend {
         var cameraOffset = new Vector3f();
 
         var position = new Vector3f();
-        SampledTexture sampler0 = this.pipeline.getSamplers().contains("Sampler0") ? this.binds.get("Sampler0") : null;
+        SoftShader sampler0 = this.pipeline.getSamplers().contains("Sampler0") ? this.binds.get("Sampler0") : null;
         SampledTexture sampler1 = this.pipeline.getSamplers().contains("Sampler1") ? this.binds.get("Sampler1") : null;
         SampledTexture sampler2 = this.pipeline.getSamplers().contains("Sampler2") ? this.binds.get("Sampler2") : null;
 
@@ -485,104 +505,218 @@ public class SoftRenderPass implements RenderPassBackend {
                 new Vector3f(), new Vector3f(), new Vector3f(),
         };
 
+        var lineWidth = new float[9];
+        Arrays.fill(lineWidth, 0.5f);
+
+        Scissor scissor;
+        if (this.scissor != null) {
+            scissor = new Scissor(
+                    Math.max(this.scissor.x1, 0), Math.max(this.scissor.y1, 0),
+                    Math.min(this.scissor.x2, colorOutput.width()), Math.min(this.scissor.y2, colorOutput.height())
+            );
+        } else {
+            scissor = new Scissor(0, 0, colorOutput.width(), colorOutput.height());
+        }
+
         var vertexMode = this.pipeline.getVertexFormatMode();
 
-        var colorOffset = this.colorOffset;
         var uvOffset = sampler0 != null ? this.uvOffset : -1;
         var uv1Offset = sampler1 != null ? this.uv1Offset : -1;
         var uv2Offset = sampler2 != null ? this.uv2Offset : -1;
 
-        if (vertexMode != VertexFormat.Mode.QUADS && vertexMode != VertexFormat.Mode.TRIANGLES)
-            return;
+        if (this.pipeline == RenderPipelines.END_PORTAL) {
+            sampler0 = new EndShader((SampledTexture) sampler0, 0x444444FF, (int) System.currentTimeMillis() / 2);
+        } else if (this.pipeline == RenderPipelines.END_GATEWAY) {
+            sampler0 = new EndShader((SampledTexture) sampler0, 0x555577FF, (int) System.currentTimeMillis() / 3);
+        }
 
         var workMat = new Matrix4f();
         workMat.set(projMat).mul(modelViewMat);
 
-        int layer = 0;
-        int triangle = 0;
+        if (vertexMode == VertexFormat.Mode.QUADS || vertexMode == VertexFormat.Mode.TRIANGLES) {
+            int layer = 0;
+            int triangle = 0;
 
-        for (int i = 0; i < drawCount; i += 3) {
-            for (int a = 0; a < 3; a++) {
-                var id = indexType == null
-                        ? i + a + baseVertex
-                        : indexType == VertexFormat.IndexType.INT
-                        ? indexBuffer.getInt(indexStart + (i + a) * 4) + baseVertex
-                        : indexBuffer.getShort(indexStart + (i + a) * 2) + baseVertex;
+            for (int i = 0; i < drawCount; i += 3) {
+                for (int a = 0; a < 3; a++) {
+                    var pos = vertInit + getVertexPos(indexType, indexBuffer, indexStart, i + a, baseVertex) * vertexLength;
 
-                var pos = vertInit + id * vertexLength;
+                    this.readVertexFull(
+                            vertexBuffer, vec, uvs, colors, normals, lineWidth,
+                            position, colorModulator, workMat, textureMat, lightDir0, lightDir1,
+                            sampler1, sampler2, vertexMode == VertexFormat.Mode.TRIANGLES || (triangle & 1) == 0, hasLighting,
+                            uvOffset, uv1Offset, uv2Offset, pos, a
+                    );
+
+                    if (isGlint) {
+                        colors[a].w *= glintAlpha;
+                    }
+                }
+
+                int vertStart = 0;
+                int actualVertCount = 3;
+
+                if (vec[0].w <= 0.05f || vec[1].w <= 0.05f || vec[2].w <= 0.05f) {
+                    actualVertCount = clipTriangleWFast(vec, uvs, colors, normals, 3) + 3;
+
+                    vertStart = 3;
+                }
+
+                if (this.pipeline == RenderPipelines.PANORAMA) {
+                    layer = switch (triangle / 2) {
+                        case 0 -> 4; // B
+                        case 1 -> 0; // C
+                        case 2 -> 5; // D
+                        case 3 -> 1; // A
+                        case 4 -> 3; // UP
+                        case 5 -> 2; // Down
+                        default -> 0;
+                    };
+                }
+
+                for (var t = vertStart; t < actualVertCount; t += 3) {
+                    convertIntoScreenSpace(vec[t], halfWidth, halfHeight);
+                    convertIntoScreenSpace(vec[t + 1], halfWidth, halfHeight);
+                    convertIntoScreenSpace(vec[t + 2], halfWidth, halfHeight);
+
+                    if (vec[t].z < -1 && vec[t + 1].z < -1 && vec[t + 2].z < -1) {
+                        continue;
+                    }
+
+                    drawTriangle(colorOutput, depthOutput, scissor, t, vec, uvs, colors, sampler0, layer);
+                }
+
+                triangle++;
+            }
+        } else if (vertexMode == VertexFormat.Mode.TRIANGLE_FAN) {
+            var pos0 = vertInit + getVertexPos(indexType, indexBuffer, indexStart, 0, baseVertex) * vertexLength;
+            var pos1 = vertInit + getVertexPos(indexType, indexBuffer, indexStart, 1, baseVertex) * vertexLength;
+
+            this.readVertexFull(
+                    vertexBuffer, vec, uvs, colors, normals, lineWidth,
+                    position, colorModulator, workMat, textureMat, lightDir0, lightDir1,
+                    sampler1, sampler2, true, hasLighting,
+                    uvOffset, uv1Offset, uv2Offset, pos0, 0
+            );
+            this.readVertexFull(
+                    vertexBuffer, vec, uvs, colors, normals, lineWidth,
+                    position, colorModulator, workMat, textureMat, lightDir0, lightDir1,
+                    sampler1, sampler2, true, hasLighting,
+                    uvOffset, uv1Offset, uv2Offset, pos1, 1
+            );
+
+            for (int i = 2; i < drawCount; i += 1) {
+                var pos = vertInit + getVertexPos(indexType, indexBuffer, indexStart, i, baseVertex) * vertexLength;
 
                 this.readVertexFull(
-                        vertexBuffer, vec, uvs, colors, normals,
+                        vertexBuffer, vec, uvs, colors, normals, lineWidth,
                         position, colorModulator, workMat, textureMat, lightDir0, lightDir1,
-                        sampler1, sampler2, vertexMode == VertexFormat.Mode.TRIANGLES || (triangle & 1) == 0, hasLighting,
-                        colorOffset, uvOffset, uv1Offset, uv2Offset, pos, a
+                        sampler1, sampler2, true, hasLighting,
+                        uvOffset, uv1Offset, uv2Offset, pos, 2
                 );
 
-                if (isGlint) {
-                    colors[a].w *= glintAlpha;
-                }
-            }
+                int vertStart = 3;
+                int actualVertCount = 6;
 
-            int vertStart = 0;
-            int actualVertCount = 3;
-
-            if (vec[0].w <= 0.001f || vec[1].w <= 0.001f || vec[2].w <= 0.001f) {
-                actualVertCount = clipTriangleWFast(vec, uvs, colors, 3) + 3;
-
-                vertStart = 3;
-            }
-
-            if (this.pipeline == RenderPipelines.PANORAMA) {
-                layer = switch (triangle / 2) {
-                    case 0 -> 4; // B
-                    case 1 -> 0; // C
-                    case 2 -> 5; // D
-                    case 3 -> 1; // A
-                    case 4 -> 3; // UP
-                    case 5 -> 2; // Down
-                    default -> 0;
-                };
-            }
-
-            for (var t = vertStart; t < actualVertCount; t += 3) {
-                int scale = 1;
-
-                vec[t].w = 1 / vec[t].w;
-                vec[t].mul(halfWidth * vec[t].w / scale, halfHeight * vec[t].w / scale, vec[t].w, 1).add(halfWidth, halfHeight, 0, 0);
-
-                vec[t + 1].w = 1 / vec[t + 1].w;
-                vec[t + 1].mul(halfWidth * vec[t + 1].w / scale, halfHeight * vec[t + 1].w / scale, vec[t + 1].w, 1).add(halfWidth, halfHeight, 0, 0);
-
-                vec[t + 2].w = 1 / vec[t + 2].w;
-                vec[t + 2].mul(halfWidth * vec[t + 2].w / scale, halfHeight * vec[t + 2].w / scale, vec[t + 2].w, 1).add(halfWidth, halfHeight, 0, 0);
-
-                if (vec[t].z < -1 && vec[t + 1].z < -1 && vec[t + 2].z < -1) {
-                    continue;
+                if (vec[0].w <= 0.05f || vec[1].w <= 0.05f || vec[2].w <= 0.05f) {
+                    actualVertCount = clipTriangleWFast(vec, uvs, colors, normals, vertStart) + 3;
+                } else {
+                    copy(0, vertStart, vec, uvs, colors, normals);
+                    copy(1, vertStart + 1, vec, uvs, colors, normals);
+                    copy(2, vertStart + 2, vec, uvs, colors, normals);
                 }
 
-                drawTriangle(colorOutput, depthOutput, t, vec, uvs, colors, sampler0, layer);
-            }
+                for (var t = vertStart; t < actualVertCount; t += 3) {
+                    convertIntoScreenSpace(vec[t], halfWidth, halfHeight);
+                    convertIntoScreenSpace(vec[t + 1], halfWidth, halfHeight);
+                    convertIntoScreenSpace(vec[t + 2], halfWidth, halfHeight);
 
-            triangle++;
+                    if (vec[t].z < -1 && vec[t + 1].z < -1 && vec[t + 2].z < -1) {
+                        continue;
+                    }
+
+                    drawTriangle(colorOutput, depthOutput, scissor, t, vec, uvs, colors, sampler0, 0);
+                }
+                copy(2, 1, vec, uvs, colors, normals);
+            }
+        } else if (vertexMode == VertexFormat.Mode.LINES) {
+            int layer = 0;
+
+            for (int i = 0; i < drawCount; i += 2) {
+                for (int a = 0; a < 2; a++) {
+                    var pos = vertInit + getVertexPos(indexType, indexBuffer, indexStart, i + a, baseVertex) * vertexLength;
+
+                    this.readVertexFull(
+                            vertexBuffer, vec, uvs, colors, normals, lineWidth,
+                            position, colorModulator, workMat, textureMat, lightDir0, lightDir1,
+                            sampler1, sampler2, true, false,
+                            uvOffset, uv1Offset, uv2Offset, pos, a
+                    );
+
+                    if (isGlint) {
+                        colors[a].w *= glintAlpha;
+                    }
+                }
+
+                int vertStart = 0;
+                int actualVertCount = 2;
+
+                if (vec[0].w <= 0.05f || vec[1].w <= 0.05f) {
+                    actualVertCount = clipLineWFast(vec, uvs, colors, normals, lineWidth, 2) + 2;
+                    vertStart = 2;
+                }
+
+                for (var t = vertStart; t < actualVertCount; t += 2) {
+                    convertIntoScreenSpace(vec[t], halfWidth, halfHeight);
+                    convertIntoScreenSpace(vec[t + 1], halfWidth, halfHeight);
+
+                    if (vec[t].z < -1 && vec[t + 1].z < -1) {
+                        continue;
+                    }
+
+                    drawLine(colorOutput, depthOutput, scissor, t, vec, uvs, colors, lineWidth, sampler0, layer);
+                }
+            }
         }
     }
 
-    private void readVertexFull(ByteBuffer vertexBuffer, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals,
+    private int getVertexPos(VertexFormat.@Nullable IndexType indexType, @Nullable ByteBuffer indexBuffer, int indexStart, int i, int baseVertex) {
+        return indexType == null
+                ? i + baseVertex
+                : indexType == VertexFormat.IndexType.INT
+                ? indexBuffer.getInt(indexStart + i * 4) + baseVertex
+                : indexBuffer.getShort(indexStart + i * 2) + baseVertex;
+    }
+
+    private void convertIntoScreenSpace(Vector4f vec, float halfWidth, float halfHeight) {
+        vec.w = 1 / vec.w;
+        vec.mul(halfWidth * vec.w, halfHeight * vec.w, vec.w, 1).add(halfWidth, halfHeight, 0, 0);
+    }
+
+    private void readVertexFull(ByteBuffer vertexBuffer, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors,
+                                Vector3f[] normals, float[] lineWidth,
                                 Vector3f position, Vector4f colorModulator, Matrix4f workMat, Matrix4f textureMat,
                                 Vector3f lightDir0, Vector3f lightDir1, @Nullable SampledTexture sampler1, @Nullable SampledTexture sampler2,
                                 boolean triangleMode, boolean hasLighting,
-                                int colorOffset, int uvOffset, int uv1Offset, int uv2Offset,
+                                int uvOffset, int uv1Offset, int uv2Offset,
                                 int pos, int a) {
         var tmpVec4f = vec[vec.length - 1];
 
-        vec[a].set(
-                vertexBuffer.getFloat(pos + positionOffset) + position.x,
-                vertexBuffer.getFloat(pos + positionOffset + 4) + position.y,
-                vertexBuffer.getFloat(pos + positionOffset + 8) + position.z,
-                1
-        );
+        if (positionOffset != -1) {
+            vec[a].set(
+                    vertexBuffer.getFloat(pos + positionOffset) + position.x,
+                    vertexBuffer.getFloat(pos + positionOffset + 4) + position.y,
+                    vertexBuffer.getFloat(pos + positionOffset + 8) + position.z,
+                    1
+            );
 
-        workMat.transform(vec[a]);
+
+            //vec[a].add(Mth.sin(vec[a].x) * 0.2f, Mth.sin(vec[a].y)  * 0.2f, Mth.sin(vec[a].z) * 0.2f, 0);
+            //vec[a].set(Math.atan(vec[a].x * 0.2) * 5, Math.atan(vec[a].y  * 0.2) * 5, Math.atan(vec[a].z  * 0.2) * 5, 1);
+            workMat.transform(vec[a]);
+        } else {
+            vec[a].set(0);
+        }
 
         if (colorOffset != -1) {
             var color = Integer.reverseBytes(vertexBuffer.getInt(pos + colorOffset));
@@ -641,23 +775,23 @@ public class SoftRenderPass implements RenderPassBackend {
             var u = Mth.clamp(vertexBuffer.getShort(pos + uv2Offset) / 256f + 0.5f / 16f, 0.5f / 16f, 15.5f / 16f);
             var v = Mth.clamp(vertexBuffer.getShort(pos + uv2Offset + 2) / 256f + 0.5f / 16f, 0.5f / 16f, 15.5f / 16f);
 
-            var color = sampler2.sample(u, v, 0, 0);
+            var color = sampler2.sample(0, 0, u, v, 0, 0);
             colors[a].mul(RGBA.redFloat(color), RGBA.greenFloat(color), RGBA.blueFloat(color), RGBA.alphaFloat(color));
         }
     }
 
-    private int clipTriangleWFast(Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, int out) {
-        final var clipSpace = 0.001f;
-        var clip0 = vec[0].w < 0.001f ? 1 : 0;
-        var clip1 = vec[1].w < 0.001f ? 1 : 0;
-        var clip2 = vec[2].w < 0.001f ? 1 : 0;
+    private int clipTriangleWFast(Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals, int out) {
+        final var clipSpace = 0.05f;
+        var clip0 = vec[0].w < clipSpace ? 1 : 0;
+        var clip1 = vec[1].w < clipSpace ? 1 : 0;
+        var clip2 = vec[2].w < clipSpace ? 1 : 0;
 
         var outOfBounds = clip0 + clip1 + clip2;
 
         if (outOfBounds == 0) {
-            copy(0, out++, vec, uvs, colors);
-            copy(1, out++, vec, uvs, colors);
-            copy(2, out++, vec, uvs, colors);
+            copy(0, out++, vec, uvs, colors, normals);
+            copy(1, out++, vec, uvs, colors, normals);
+            copy(2, out++, vec, uvs, colors, normals);
             return 3;
         } else if (outOfBounds == 1) {
             var clipIndex = (clip0 == 1 ? 0 : clip1 == 1 ? 1 : 2);
@@ -668,13 +802,13 @@ public class SoftRenderPass implements RenderPassBackend {
             var fracNext = (clipSpace - vec[clipIndex].w) / (vec[nextIndex].w - vec[clipIndex].w);
             var fracPrevious = (clipSpace - vec[clipIndex].w) / (vec[previousIndex].w - vec[clipIndex].w);
 
-            lerp(clipIndex, previousIndex, out++, vec, uvs, colors, fracPrevious);
-            lerp(clipIndex, nextIndex, out++, vec, uvs, colors, fracNext);
-            copy(previousIndex, out++, vec, uvs, colors);
+            lerp(clipIndex, previousIndex, out++, vec, uvs, colors, normals, fracPrevious);
+            lerp(clipIndex, nextIndex, out++, vec, uvs, colors, normals, fracNext);
+            copy(previousIndex, out++, vec, uvs, colors, normals);
 
-            lerp(clipIndex, nextIndex, out++, vec, uvs, colors, fracNext);
-            copy(nextIndex, out++, vec, uvs, colors);
-            copy(previousIndex, out++, vec, uvs, colors);
+            lerp(clipIndex, nextIndex, out++, vec, uvs, colors, normals, fracNext);
+            copy(nextIndex, out++, vec, uvs, colors, normals);
+            copy(previousIndex, out++, vec, uvs, colors, normals);
 
             return 6;
         } else if (outOfBounds == 2) {
@@ -684,11 +818,35 @@ public class SoftRenderPass implements RenderPassBackend {
             var fracNext = (clipSpace - vec[notClippedIndex].w) / (vec[nextIndex].w - vec[notClippedIndex].w);
             var fracPrevious = (clipSpace - vec[notClippedIndex].w) / (vec[previousIndex].w - vec[notClippedIndex].w);
 
-            lerp(notClippedIndex, previousIndex, out++, vec, uvs, colors, fracPrevious);
-            copy(notClippedIndex, out++, vec, uvs, colors);
-            lerp(notClippedIndex, nextIndex, out++, vec, uvs, colors, fracNext);
+            lerp(notClippedIndex, previousIndex, out++, vec, uvs, colors, normals, fracPrevious);
+            copy(notClippedIndex, out++, vec, uvs, colors, normals);
+            lerp(notClippedIndex, nextIndex, out++, vec, uvs, colors, normals, fracNext);
 
             return 3;
+        }
+        return 0;
+    }
+
+    private int clipLineWFast(Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors, Vector3f[] normals, float[] lineWidth, int out) {
+        final var clipSpace = 0.05f;
+        var clip0 = vec[0].w < clipSpace ? 1 : 0;
+        var clip1 = vec[1].w < clipSpace ? 1 : 0;
+
+        var outOfBounds = clip0 + clip1 ;
+
+        if (outOfBounds == 0) {
+            copy(0, out++, vec, uvs, colors, normals);
+            copy(1, out++, vec, uvs, colors, normals);
+            return 2;
+        } else if (outOfBounds == 1) {
+            var clipIndex = clip0 == 1 ? 0 : 1;
+            var nextIndex = (clipIndex + 1) % 2;
+
+            var fracNext = (clipSpace - vec[clipIndex].w) / (vec[nextIndex].w - vec[clipIndex].w);
+
+            lerp(clipIndex, nextIndex, out++, vec, uvs, colors, normals, lineWidth, fracNext);
+            copy(nextIndex, out++, vec, uvs, colors, normals, lineWidth);
+            return 4;
         }
         return 0;
     }
@@ -697,9 +855,9 @@ public class SoftRenderPass implements RenderPassBackend {
         return Math.fma(by - ay, bx + ax, Math.fma(cy - by, cx + bx, (ay - cy) * (ax + cx)));
     }
 
-    private void drawTriangle(RGBATexture color, @Nullable DepthTexture depth,
+    private void drawTriangle(RGBATexture color, @Nullable DepthTexture depth, Scissor scissor,
                               int offset, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors,
-                              @Nullable SampledTexture texture, int layer) {
+                              @Nullable SoftShader texture, int layer) {
         var vec0 = vec[offset];
         var vec1 = vec[offset + 1];
         var vec2 = vec[offset + 2];
@@ -708,8 +866,6 @@ public class SoftRenderPass implements RenderPassBackend {
         var maxX = (int) Math.max(vec0.x, Math.max(vec1.x, vec2.x));
         var minY = (int) Math.min(vec0.y, Math.min(vec1.y, vec2.y));
         var maxY = (int) Math.max(vec0.y, Math.max(vec1.y, vec2.y));
-
-        var scissor = this.scissor;
 
         if (minX > scissor.x2() || maxX < scissor.x1() || minY > scissor.y2() || maxY < scissor.y1()) {
             return;
@@ -733,6 +889,7 @@ public class SoftRenderPass implements RenderPassBackend {
 
         var totalArea = signedTriangleArea(vec0.x, vec0.y, vec1.x, vec1.y, vec2.x, vec2.y);
         if (totalArea < 0.25f && (this.pipeline.isCull() || totalArea > -0.25f)) return;
+        var side = Mth.sign(totalArea);
 
         totalArea = 1 / totalArea;
         //for (int y = minY & 0xFFFFFFF8; y <= maxY; y += 8) {
@@ -740,20 +897,20 @@ public class SoftRenderPass implements RenderPassBackend {
             int yOffset = color.width() * y;
             for (int x = minX; x <= maxX; x++) {
 
-                var alpha = signedTriangleArea(x + 0.25f, y + 0.25f, vec1.x, vec1.y, vec2.x, vec2.y);
-                if (alpha < 0) continue;
+                var alpha = signedTriangleArea(x +0.75f, y +0.75f, vec1.x, vec1.y, vec2.x, vec2.y);
+                if (alpha * side < 0) continue;
 
-                var beta = signedTriangleArea(x + 0.25f, y + 0.25f, vec2.x, vec2.y, vec0.x, vec0.y);
-                if (beta < 0) continue;
+                var beta = signedTriangleArea(x +0.75f, y +0.75f, vec2.x, vec2.y, vec0.x, vec0.y);
+                if (beta * side < 0) continue;
 
-                var gamma = signedTriangleArea(x + 0.25f, y + 0.25f, vec0.x, vec0.y, vec1.x, vec1.y);
-                if (gamma < 0) continue;
+                var gamma = signedTriangleArea(x +0.75f, y +0.75f, vec0.x, vec0.y, vec1.x, vec1.y);
+                if (gamma * side < 0) continue;
 
                 alpha *= totalArea;
                 beta *= totalArea;
                 gamma *= totalArea;
 
-                var z = Math.fma(alpha, vec0.z, Math.fma(beta, vec1.z, gamma * vec2.z));
+                var z = Math.fma(alpha, vec0.z, Math.fma(beta, vec1.z, gamma * vec2.z)) + this.depthBias;
 
                 if (this.limitDepth && (z < -1 || z > 1)) {
                     continue;
@@ -768,7 +925,7 @@ public class SoftRenderPass implements RenderPassBackend {
                     if (texture != null) {
                         var u = Math.fma(alpha, uv0.x, Math.fma(beta, uv1.x, gamma * uv2.x)) * invW;
                         var v = Math.fma(alpha, uv0.y, Math.fma(beta, uv1.y, gamma * uv2.y)) * invW;
-                        RGBA.toVector4f(texture.sample(u, v, layer, 0), drawnColor);
+                        RGBA.toVector4f(texture.sample(x, y, u, v, layer, 0), drawnColor);
                     } else {
                         drawnColor.set(1f);
                     }
@@ -794,10 +951,92 @@ public class SoftRenderPass implements RenderPassBackend {
                     color.data()[x + yOffset] = out;
                 }
             }
-
         }
     }
 
+    private void drawLine(RGBATexture color, @Nullable DepthTexture depth, Scissor scissor,
+                          int offset, Vector4f[] vec, Vector2f[] uvs, Vector4f[] colors,
+                          float[] lineWidth, @Nullable SoftShader texture, int layer) {
+        var vec0 = vec[offset];
+        var vec1 = vec[offset + 1];
+
+        var minX = (int) Math.min(vec0.x, vec1.x);
+        var maxX = (int) Math.max(vec0.x, vec1.x);
+        var minY = (int) Math.min(vec0.y, vec1.y);
+        var maxY = (int) Math.max(vec0.y, vec1.y);
+
+        if (minX > scissor.x2() || maxX < scissor.x1() || minY > scissor.y2() || maxY < scissor.y1()) {
+            return;
+        }
+
+        minX = Math.max(minX, scissor.x1);
+        maxX = Math.min(maxX, scissor.x2 - 1);
+        minY = Math.max(minY, scissor.y1);
+        maxY = Math.min(maxY, scissor.y2 - 1);
+
+        var drawnColor = new Vector4f();
+        var originalColor = new Vector4f();
+
+        var uv0 = uvs[offset];
+        var uv1 = uvs[offset + 1];
+
+        var color0 = colors[offset];
+        var color1 = colors[offset + 1];
+
+        var length = vec0.distance(vec1.x, vec1.y, vec0.z, vec0.w);
+
+        var lineWidth0 = lineWidth[offset];
+        var lineWidth1 = lineWidth[offset + 1];
+
+        for (int y = minY; y <= maxY; y++) {
+            int yOffset = color.width() * y;
+            for (int x = minX; x <= maxX; x++) {
+                var r = Math.abs(signedTriangleArea(x + 0.5f, y + 0.5f, vec0.x, vec0.y, vec1.x, vec1.y)) / length;
+
+                if (r > lineWidth0) continue;
+                var distFrom0 = vec0.distanceSquared(x + 0.5f, y + 0.5f, vec0.z, vec0.w);
+                var dist = Mth.sqrt(distFrom0 - r * r);
+
+                var delta = Mth.clamp(dist / length, 0, 1);
+
+                var z = Mth.lerp(delta, vec0.z, vec1.z) + this.depthBias - Mth.EPSILON * 10;
+
+                if (this.limitDepth && (z < -1 || z > 1)) {
+                    continue;
+                }
+
+                if (depth == null || this.depthTest.test(depth.data()[x + yOffset], z)) {
+                    if (texture != null) {
+                        var u = Mth.lerp(delta, uv0.x, uv1.x);
+                        var v = Mth.lerp(r, uv0.y, uv1.y);
+                        RGBA.toVector4f(texture.sample(x, y, u, v, layer, 0), drawnColor);
+                    } else {
+                        drawnColor.set(1f);
+                    }
+
+                    drawnColor.mul(
+                            Mth.lerp(delta, color0.x, color1.x) ,
+                            Mth.lerp(delta, color0.y, color1.y),
+                            Mth.lerp(delta, color0.z, color1.z),
+                            Mth.lerp(delta, color0.w, color1.w)
+                    );
+
+                    if (this.blender == ColorBlender.SOLID) {
+                        drawnColor.w = 1;
+                    } else if (drawnColor.w < 0.05) {
+                        continue;
+                    }
+
+                    if (this.writeDepth && depth != null) {
+                        depth.data()[x + yOffset] = z;
+                    }
+
+                    var out = this.blender.blend(RGBA.toVector4f(color.data()[x + yOffset], originalColor), drawnColor);
+                    color.data()[x + yOffset] = out;
+                }
+            }
+        }
+    }
 
     @Override
     public void close() {
@@ -817,47 +1056,6 @@ public class SoftRenderPass implements RenderPassBackend {
 
     public interface DrawCall {
         void draw(ByteBuffer vertexBuffer, @Nullable ByteBuffer indexBuffer, int baseVertex, int firstIndex, int drawCount, VertexFormat.@Nullable IndexType indexType, int instanceCount, Map<String, Std140Reader> uniforms);
-    }
-
-    private record SampledTexture(SoftTextureView texture, SoftSampler sampler) {
-        public int sample(float u, float v, int layer, int mip) {
-
-            var width = texture.texture().getWidth(texture.baseMipLevel() + mip);
-            var height = texture.texture().getHeight(texture.baseMipLevel() + mip);
-
-            var x = (int) (u * width);
-            var y = (int) (v * height);
-
-            if (sampler.getAddressModeU() == AddressMode.REPEAT) {
-                x = x % width;
-                if (x < 0) {
-                    x = width - x;
-                }
-            } else {
-                x = Mth.clamp(x, 0, width - 1);
-            }
-
-            if (sampler.getAddressModeV() == AddressMode.REPEAT) {
-                y = y % width;
-                if (u < 0) {
-                    y = height - y;
-                }
-            } else {
-                y = Mth.clamp(y, 0, height - 1);
-            }
-
-            return texture.texture().getRGBA(layer, texture.baseMipLevel() + mip, x, y);
-        }
-
-        public int sampleRaw(short u, short v, int layer, int mip) {
-            var width = texture.texture().getWidth(texture.baseMipLevel());
-            var height = texture.texture().getHeight(texture.baseMipLevel());
-
-            var x = Mth.clamp(u, 0, width - 1);
-            var y = Mth.clamp(v, 0, height - 1);
-
-            return texture.texture().getRGBA(layer, texture.baseMipLevel() + mip, x, y);
-        }
     }
 
     private record Scissor(int x1, int y1, int x2, int y2) {
@@ -886,6 +1084,13 @@ public class SoftRenderPass implements RenderPassBackend {
                 Math.clamp(image.z + drawn.z, 0, 1),
                 Math.clamp(image.w + drawn.w, 0, 1)
         ));
+        public static final ColorBlender SUBTRACTIVE = new ColorBlender("subtractive", (image, drawn) -> RGBA.colorFromFloatRGBA(
+                Math.clamp(image.x - drawn.x, 0, 1),
+                Math.clamp(image.y - drawn.y, 0, 1),
+                Math.clamp(image.z - drawn.z, 0, 1),
+                image.w
+        ));
+
         public static final ColorBlender MULTIPLY = new ColorBlender("multiply", (image, drawn) -> RGBA.fromVector4f(image.mul(drawn.x, drawn.y, drawn.z, 1)));
         public static final ColorBlender OVERLAY = new ColorBlender("overlay", (image, drawn) -> RGBA.colorFromFloatRGBA(
                 Math.clamp(image.x + drawn.x * drawn.w, 0, 1),
@@ -894,7 +1099,7 @@ public class SoftRenderPass implements RenderPassBackend {
                 image.w
         ));
 
-        final int blend(Vector4f image, Vector4f drawn) {
+        int blend(Vector4f image, Vector4f drawn) {
             return this.blend.applyAsInt(image, drawn);
         }
     }
