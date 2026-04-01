@@ -912,7 +912,7 @@ public class SoftRenderPass implements RenderPassBackend {
 
                 var z = Math.fma(alpha, vec0.z, Math.fma(beta, vec1.z, gamma * vec2.z)) + this.depthBias;
 
-                if (this.limitDepth && (z < -1 || z > 1)) {
+                if (this.limitDepth && (z < 0 || z > 1)) {
                     continue;
                 }
 
@@ -1001,7 +1001,7 @@ public class SoftRenderPass implements RenderPassBackend {
 
                 var z = Mth.lerp(delta, vec0.z, vec1.z) + this.depthBias - Mth.EPSILON * 10;
 
-                if (this.limitDepth && (z < -1 || z > 1)) {
+                if (this.limitDepth && (z < 0 || z > 1)) {
                     continue;
                 }
 
